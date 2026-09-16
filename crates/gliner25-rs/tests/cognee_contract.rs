@@ -23,9 +23,15 @@
 //   scenarios (`REL_AGREEMENT_*_FLOOR`), and those floors are a drift tripwire,
 //   not a quality bar. Two reasons, both load-bearing:
 //
-//   1. Per scenario the agreement is far below the mean — precision drops to
-//      0.205 on `very_long` and 0.400 on `medium` on a *correct* engine. Any
-//      per-scenario relation assertion fails a healthy build. Never add one.
+//   1. It stays a macro average even now that 7b-4 took every scenario to
+//      1.000/1.000. Before 7b-4 the per-scenario spread was enormous
+//      (precision 0.205 on `very_long`, 0.400 on `medium`) and a per-scenario
+//      assertion failed a healthy build. That spread is gone, but the reason
+//      not to add a per-scenario floor is now a different one: `short` carries
+//      **two** reference edges, so one edge moving there is a 0.500 swing, and
+//      a per-scenario floor would have to be either so low it asserts nothing
+//      or so high that the smallest scenario dictates the gate. Keep it a
+//      mean; `REL_AGREEMENT_*_FLOOR` documents how the values were chosen.
 //
 //   2. Agreement with Python is not correctness. On `long` the two
 //      implementations agree on 18 edges of which 7 are factually false
@@ -73,12 +79,47 @@ const SCENARIOS_JSON: &str = include_str!("fixtures/cognee_parity_scenarios.json
 /// Python `gliner2` 2.0.0 ground truth. Copied from `_shared/`.
 const PY_REFERENCE_JSON: &str = include_str!("fixtures/py_reference.json");
 
-/// Share of Python's relation set this engine reproduces. Measured mean: 0.829.
-/// A tripwire for drift, **not** a quality bar — see the module comment.
-const REL_AGREEMENT_RECALL_FLOOR: f64 = 0.80;
-/// Share of this engine's relation set Python agrees with. Measured mean: 0.542.
-/// A tripwire for drift, **not** a quality bar — see the module comment.
-const REL_AGREEMENT_PRECISION_FLOOR: f64 = 0.50;
+// ── the relation floors ──────────────────────────────────────────────────────
+//
+// RAISED IN 7b-5, from 0.80 / 0.50 (the pre-neural-scorer measurement of
+// 0.829 / 0.542) to 0.95 / 0.90. Measured mean after 7b-4 is **1.000 / 1.000**,
+// identical across three runs and both `Fp16IoBinding` and `Fp32`, so the old
+// floors had 0.20 / 0.50 of slack and could not see a regression. 7b-4 proved
+// that concretely: deleting the *entire* four-stage de-duplication scored
+// 0.875 / 0.698 and still **passed** the old gate.
+//
+// How these two numbers were chosen — the unit of change is one edge, and the
+// reference sets are 2 / 9 / 20 / 12 edges (`short` / `medium` / `long` /
+// `very_long`), so the worst-case macro cost of a single edge moving in a
+// scenario with at least nine of them is:
+//
+//   recall    `medium` 8/9  -> mean 0.972     `very_long` 11/12 -> mean 0.979
+//   precision `medium` 9/10 -> mean 0.975     `very_long` 12/13 -> mean 0.981
+//
+// 0.95 / 0.90 therefore leaves room for **one** borderline score crossing the
+// 0.5 decode threshold in any scenario but `short`, and fails on two. That is
+// the honest headroom: fp16 and fp32 agree exactly today, so the slack is for
+// another machine's kernels, not for drift. `short` deliberately gets no
+// one-edge headroom — it is 18 words in a single window, the most deterministic
+// case in the fixture, and losing one of its two edges is a regression.
+//
+// The floors bite on every degradation measured so far:
+//
+//   pre-7b-4 (cartesian pairing)        0.829 / 0.542  -> red
+//   7b-4 probe E (no de-duplication)    0.875 / 0.698  -> red
+//   7b-4 probe F (decode at 0.2)        0.942 / 0.705  -> red
+//
+// Deliberately **not** set to 1.000: an exact-equality gate turns any single
+// kernel difference into a hard failure and invites someone to chase the
+// number. See item 2 of the module comment — a change that *lowers* agreement
+// may be a factual improvement, and the floors are reassessed then, not chased.
+
+/// Share of Python's relation set this engine reproduces. Measured mean: 1.000
+/// (was 0.829 before 7b-4). A tripwire for drift, **not** a quality bar.
+const REL_AGREEMENT_RECALL_FLOOR: f64 = 0.95;
+/// Share of this engine's relation set Python agrees with. Measured mean: 1.000
+/// (was 0.542 before 7b-4). A tripwire for drift, **not** a quality bar.
+const REL_AGREEMENT_PRECISION_FLOOR: f64 = 0.90;
 
 /// Fixture order. Asserted, so a truncated run fails instead of passing on a
 /// mean taken over one scenario.
@@ -576,9 +617,9 @@ fn run(models: &Path) -> Result<()> {
     );
 
     // ── 4. relations: macro-average floors ONLY ─────────────────────────────
-    // Never assert per scenario (precision is 0.205 on `very_long` when
-    // everything is working), and never add an upper bound — an improvement
-    // must not fail the gate.
+    // Never assert per scenario — `short` has two reference edges, so one edge
+    // moving there is a 0.500 swing — and never add an upper bound: an
+    // improvement must not fail the gate.
     assert!(
         mean_rel_recall >= REL_AGREEMENT_RECALL_FLOOR,
         "mean relation agreement recall {mean_rel_recall:.3} < {REL_AGREEMENT_RECALL_FLOOR:.3}; \
