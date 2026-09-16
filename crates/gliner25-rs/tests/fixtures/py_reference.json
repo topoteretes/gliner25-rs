@@ -1,0 +1,269 @@
+{
+ "model": "fastino/gliner2.5-base-v1",
+ "threshold": 0.5,
+ "chunk_size": 384,
+ "chunk_overlap": 64,
+ "overlap_policy": "longest",
+ "load_seconds": 84.252,
+ "entity_types": {
+  "person": "Full name of a human being",
+  "organization": "Company, institution, agency, team, or other named group",
+  "location": "City, country, region, address, or other named place",
+  "date": "Calendar date or specific point in time",
+  "money": "Monetary amount with or without a currency",
+  "product": "Commercial product or service"
+ },
+ "relation_types": {
+  "works_for": "Person is employed by or works at an organization",
+  "headquartered_in": "Organization has its headquarters in a place",
+  "founded_by": "Organization was founded by a person or organization",
+  "acquired": "Organization acquired another organization",
+  "produces": "Organization makes a product or technology"
+ },
+ "scenarios": [
+  {
+   "name": "short",
+   "words": 14,
+   "seconds": 0.172,
+   "entities": {
+    "person": [
+     "Tim Cook"
+    ],
+    "organization": [
+     "Apple Inc."
+    ],
+    "location": [
+     "Cupertino, California"
+    ],
+    "date": [],
+    "money": [],
+    "product": []
+   },
+   "relations": {
+    "works_for": [
+     "Tim Cook|Apple Inc."
+    ],
+    "headquartered_in": [
+     "Apple Inc.|Cupertino, California"
+    ],
+    "founded_by": [],
+    "acquired": [],
+    "produces": []
+   },
+   "entity_count": 3,
+   "relation_count": 2
+  },
+  {
+   "name": "medium",
+   "words": 69,
+   "seconds": 0.1945,
+   "entities": {
+    "person": [
+     "Dr. Dre",
+     "Jimmy Iovine",
+     "Ronald Wayne",
+     "Steve Jobs",
+     "Steve Wozniak",
+     "Tim Cook"
+    ],
+    "organization": [
+     "Apple Inc.",
+     "Beats Electronics",
+     "Compaq",
+     "IBM"
+    ],
+    "location": [
+     "Cupertino, California"
+    ],
+    "date": [
+     "1976",
+     "1998",
+     "2014"
+    ],
+    "money": [
+     "three billion dollars"
+    ],
+    "product": [
+     "Apple Watch",
+     "Mac",
+     "iPhone"
+    ]
+   },
+   "relations": {
+    "works_for": [
+     "Tim Cook|Apple Inc."
+    ],
+    "headquartered_in": [
+     "Apple Inc.|Cupertino, California"
+    ],
+    "founded_by": [
+     "Apple Inc.|Ronald Wayne",
+     "Apple Inc.|Steve Jobs",
+     "Apple Inc.|Steve Wozniak"
+    ],
+    "acquired": [
+     "Apple Inc.|Beats Electronics"
+    ],
+    "produces": [
+     "Apple Inc.|Apple Watch",
+     "Apple Inc.|Mac",
+     "Apple Inc.|iPhone"
+    ]
+   },
+   "entity_count": 18,
+   "relation_count": 9
+  },
+  {
+   "name": "long",
+   "words": 348,
+   "seconds": 0.412,
+   "entities": {
+    "person": [
+     "Dr. Dre",
+     "Jimmy Iovine",
+     "Ronald Wayne",
+     "Satya Nadella",
+     "Steve Jobs",
+     "Steve Wozniak",
+     "Tim Cook"
+    ],
+    "organization": [
+     "Apple Inc.",
+     "Beats Electronics",
+     "Compaq",
+     "GitHub",
+     "IBM",
+     "Microsoft"
+    ],
+    "location": [
+     "Cupertino",
+     "Cupertino, California",
+     "Redmond, Washington"
+    ],
+    "date": [
+     "1976",
+     "2014",
+     "2017",
+     "2018"
+    ],
+    "money": [
+     "seven and a half billion dollars",
+     "three billion dollars"
+    ],
+    "product": [
+     "Apple Watch",
+     "Azure",
+     "Mac",
+     "Windows",
+     "iPhone"
+    ]
+   },
+   "relations": {
+    "works_for": [
+     "Satya Nadella|Microsoft",
+     "Tim Cook|Apple Inc.",
+     "Tim Cook|Microsoft"
+    ],
+    "headquartered_in": [
+     "Apple Inc.|Cupertino, California",
+     "Apple Inc.|Redmond, Washington"
+    ],
+    "founded_by": [
+     "Apple Inc.|Steve Jobs",
+     "Apple Inc.|Steve Wozniak",
+     "Apple|Ronald Wayne"
+    ],
+    "acquired": [
+     "Apple Inc.|Beats Electronics",
+     "Apple Inc.|GitHub",
+     "Microsoft|Beats Electronics",
+     "Microsoft|GitHub"
+    ],
+    "produces": [
+     "Apple Inc.|Apple Watch",
+     "Apple Inc.|Mac",
+     "Apple Inc.|iPhone",
+     "Apple|Azure",
+     "Apple|Windows",
+     "Microsoft|Apple Watch",
+     "Microsoft|Azure",
+     "Microsoft|Windows"
+    ]
+   },
+   "entity_count": 27,
+   "relation_count": 20
+  },
+  {
+   "name": "very_long",
+   "words": 810,
+   "seconds": 1.2094,
+   "entities": {
+    "person": [
+     "Dr. Dre",
+     "Jensen Huang",
+     "Jimmy Iovine",
+     "Ronald Wayne",
+     "Steve Jobs",
+     "Steve Wozniak",
+     "Tim Cook"
+    ],
+    "organization": [
+     "Apple Inc.",
+     "Beats Electronics",
+     "Compaq",
+     "IBM",
+     "NVIDIA",
+     "Toyota",
+     "company"
+    ],
+    "location": [
+     "Cupertino, California",
+     "Japan",
+     "Toyota City",
+     "several countries"
+    ],
+    "date": [
+     "1976",
+     "1998",
+     "2014",
+     "2019"
+    ],
+    "money": [
+     "four billion dollars",
+     "three billion dollars"
+    ],
+    "product": [
+     "Apple Watch",
+     "Mac",
+     "iPhone"
+    ]
+   },
+   "relations": {
+    "works_for": [
+     "Jensen Huang|NVIDIA",
+     "Tim Cook|Apple Inc."
+    ],
+    "headquartered_in": [
+     "Apple Inc.|Cupertino, California",
+     "Toyota|Toyota City, Japan"
+    ],
+    "founded_by": [
+     "Apple Inc.|Ronald Wayne",
+     "Apple Inc.|Steve Jobs",
+     "Apple Inc.|Steve Wozniak",
+     "Jensen Huang|NVIDIA"
+    ],
+    "acquired": [
+     "Apple Inc.|Beats Electronics"
+    ],
+    "produces": [
+     "Apple Inc.|Apple Watch",
+     "Apple Inc.|Mac",
+     "Apple Inc.|iPhone"
+    ]
+   },
+   "entity_count": 27,
+   "relation_count": 12
+  }
+ ]
+}

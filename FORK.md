@@ -189,13 +189,65 @@ cargo test -p gliner25-rs --features \
 
 ---
 
+## Delta 3 — the cognee parity harness is a test, not an example
+
+**Files:** `crates/gliner25-rs/tests/cognee_contract.rs` (new),
+`crates/gliner25-rs/tests/fixtures/{cognee_parity_scenarios.json,py_reference.json,README.md}`
+(new), `crates/gliner25-rs/examples/cognee_parity.rs` (removed).
+
+`examples/cognee_parity.rs` was a cognee addition (`COGNEE-EVAL`), never
+upstream code: an ad-hoc runner that built the Python-`gliner2` prompt layout,
+extracted over four scenarios and wrote the candidate-evaluation contract JSON
+for a separate Python scorer to grade by hand. Everything that rests on this
+backend rests on one measurement it produced, and an example that nobody runs
+cannot defend a measurement.
+
+It is now `tests/cognee_contract.rs`: the same prompt construction — group 0
+`SchemaTask::Entities` with the descriptions folded into
+`BoundaryParams.descriptions[0]`, one `SchemaTask::Relations("<name>: <desc>",
+["head","tail"])` per relation, insertion-ordered label parsing — plus a Rust
+port of `compare_rust_python.py`'s set arithmetic, so `cargo test` scores itself
+and needs no `python3` and no path outside this tree. The two `_shared/`
+fixtures are copied in byte for byte and pulled in with `include_str!`;
+`tests/fixtures/README.md` carries their provenance and sha256s.
+
+Removing the example rather than keeping both avoids ~200 lines of
+prompt-construction logic duplicated across two targets that would have to stay
+bit-identical. Its command-line switches survive as env overrides on the test
+(`GLINER25_MODELS`, `COGNEE_PARITY_SCENARIOS`, `COGNEE_PARITY_OUT`,
+`COGNEE_PARITY_NO_DESCRIPTIONS`); `--model-label` was only ever cosmetic and is
+dropped.
+
+The test needs no features, no `--release` and no `ORT_DYLIB_PATH`: the output
+is byte-identical under the fork's default static `download-binaries` link mode,
+under `--features load-dynamic`, and at either precision. With no export on disk
+it skips with a `⚠️` line, so it is inert in a checkout that has no model.
+
+```bash
+ln -s <export> models/gliner2.5-base-v1-onnx   # models/ is gitignored
+cargo test -p gliner25-rs --test cognee_contract -- --nocapture
+```
+
+---
+
 ## Deliberately not changed
 
 - **Formatting.** Upstream's tree is not `cargo fmt`-clean under default
-  rustfmt settings (17 files differ, and there is no `rustfmt.toml`). Running
-  `cargo fmt` would bury both deltas in thousands of unrelated lines. The fork
-  leaves formatting exactly as upstream has it; the *same* 17 files differ here
-  as upstream, and no more.
+  rustfmt settings (16 files differ, and there is no `rustfmt.toml`). Running
+  `cargo fmt` would bury the deltas in thousands of unrelated lines. The fork
+  leaves formatting exactly as upstream has it; the *same* 16 files differ here
+  as upstream, and no more. (This note said 17 until Delta 3: the seventeenth
+  was the cognee-authored `examples/cognee_parity.rs`, which that delta
+  removed. Files the fork *adds* are rustfmt-clean —
+  `tests/cognee_contract.rs` is.)
+- **Upstream's clippy findings.** `cargo clippy -p gliner25-rs --all-targets
+  -- -D warnings` fails on two lints in code the fork did not write, both of
+  them lints that post-date the upstream commit: `clippy::collapsible_if` at
+  `src/boundary.rs:292` and `clippy::manual_is_multiple_of` at
+  `examples/long_document.rs:25` (Rust 1.93.0). Fixing them would touch
+  upstream lines for no cognee reason, so they stay; a clean run is
+  `-A clippy::collapsible_if -A clippy::manual_is_multiple_of`, under which the
+  whole crate, `tests/cognee_contract.rs` included, is warning-free.
 - **`ort`'s `api-NN` features.** Upstream set none (it passes
   `default-features = false`), so neither does the fork. Inside cognee, OSS's
   own `ort` entry uses default features and contributes `api-27` through
