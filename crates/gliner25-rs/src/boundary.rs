@@ -144,6 +144,40 @@ pub struct Classification {
     pub score: f32,
 }
 
+/// One end of a [`RelationEdge`].
+///
+/// Deliberately self-contained: the spans and the surface text travel with the
+/// edge instead of pointing into [`BoundaryOutput::mentions`], because merging
+/// two windows can delete a mention an edge names. See [`crate::chunker::merge`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationEndpoint {
+    pub text: String,
+    /// Byte range `[start, end)` in the original text, as [`Mention`] uses.
+    pub char_start: usize,
+    pub char_end: usize,
+    /// Half-open word range `[start, end)`.
+    pub word_start: usize,
+    pub word_end: usize,
+}
+
+/// One decoded relation, in the coordinate frame of the text that produced it.
+///
+/// Relations are *intra-window* by construction: the model's relation scorer
+/// indexes both endpoints against a single padded length, so a pair whose ends
+/// live in different windows has no shared frame and is undefined rather than
+/// merely hard. `gliner2` does the same — it scores inside the window and then
+/// merges the *decoded* edges (`chunking._merge_relation_maps`). That is why
+/// this type carries spans and text rather than hidden states.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationEdge {
+    /// The relation group's `prompt_str` (`"name: description"`), matching
+    /// [`Mention::task`]; the caller maps it back to the bare name.
+    pub relation: String,
+    pub score: f32,
+    pub head: RelationEndpoint,
+    pub tail: RelationEndpoint,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BoundaryOutput {
     pub mentions: Vec<Mention>,
@@ -153,6 +187,11 @@ pub struct BoundaryOutput {
     pub classifications: Vec<Classification>,
     /// Expected mention count per query, when the model exposes the count head.
     pub expected_counts: Vec<f32>,
+    /// Relations decoded inside the window that produced this output, ready to
+    /// be shifted by [`crate::chunker::remap`] and folded by
+    /// [`crate::chunker::merge`]. Nothing fills this in yet — the relation
+    /// scorer is not wired — so it is empty on every path today.
+    pub relations: Vec<RelationEdge>,
 }
 
 impl BoundaryOutput {

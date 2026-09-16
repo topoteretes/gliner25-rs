@@ -43,7 +43,7 @@
 //! relation whose two ends fall in different windows. Both are inherent to
 //! chunking rather than to this implementation.
 
-use crate::boundary::{BoundaryOutput, Mention};
+use crate::boundary::{BoundaryOutput, Mention, RelationEdge};
 use crate::processor::WhitespaceTokenSplitter;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -155,6 +155,104 @@ pub fn remap(output: &mut BoundaryOutput, chunk: &Chunk, text: &str) {
             m.text = s.to_string();
         }
     }
+    // Relation endpoints are window-local in exactly the same two frames, so
+    // they shift the same way. Both ends of every edge, not just the head.
+    for r in &mut output.relations {
+        for e in [&mut r.head, &mut r.tail] {
+            e.char_start += chunk.byte_start;
+            e.char_end += chunk.byte_start;
+            e.word_start += chunk.word_start;
+            e.word_end += chunk.word_start;
+            if let Some(s) = text.get(e.char_start..e.char_end) {
+                e.text = s.to_string();
+            }
+        }
+    }
+}
+
+/// Which fields decide that two relation edges are the same prediction.
+///
+/// `gliner2`'s `_canonical_key` (`chunking.py`) strips `confidence` at every
+/// level and keeps whatever else the item carries — so the key depends on the
+/// shape the caller asked for. Both shapes are reproduced here rather than one
+/// guessed, because picking the wrong one merges too much or too little without
+/// failing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RelationKeyMode {
+    /// Relation, spans and surface text; score excluded. Matches
+    /// `include_spans=True`, which is the shape the checked-in Python parity
+    /// reference was produced with, so it is the default.
+    #[default]
+    SpanAndText,
+    /// Relation and surface text only. Matches the bare `(head, tail)` tuple
+    /// `gliner2` emits when neither spans nor confidence are requested.
+    ///
+    /// In this shape the first item seen **always** survives, whatever the
+    /// scores: `_representative_confidence` (`chunking.py:403-414`) reads only a
+    /// `dict` or a `list`, and a Python tuple is neither, so it falls through to
+    /// `return 0.0` for every item — `0.0 > 0.0` is false, so the replacement
+    /// branch at `chunking.py:305` is dead on this path.
+    TextOnly,
+}
+
+/// `(relation, head text, tail text, spans when the mode keeps them)`.
+type RelationKey = (String, String, String, Option<(usize, usize, usize, usize)>);
+
+fn relation_key(edge: &RelationEdge, mode: RelationKeyMode) -> RelationKey {
+    let spans = match mode {
+        RelationKeyMode::SpanAndText => Some((
+            edge.head.char_start,
+            edge.head.char_end,
+            edge.tail.char_start,
+            edge.tail.char_end,
+        )),
+        RelationKeyMode::TextOnly => None,
+    };
+    (edge.relation.clone(), edge.head.text.clone(), edge.tail.text.clone(), spans)
+}
+
+/// Collapses relations two windows both saw, keeping first-seen order.
+///
+/// A port of the non-span branch of `gliner2`'s `_dedupe_items`: a map from the
+/// score-insensitive canonical key to a position in the output, and a duplicate
+/// replaces the incumbent only when its score is **strictly** greater — so the
+/// earlier window wins a tie, and the output order is the order in which keys
+/// were first seen.
+///
+/// Python dedupes per relation label (`_merge_relation_maps` loops over labels);
+/// the relation name is part of the key here, which has the same effect on a
+/// flat list, minus Python's grouping of the result by label.
+///
+/// The score comparison is itself mode-dependent, because Python's is: see
+/// [`RelationKeyMode::TextOnly`], where the incumbent is never replaced.
+pub fn merge_relations(parts: Vec<Vec<RelationEdge>>, mode: RelationKeyMode) -> Vec<RelationEdge> {
+    let mut seen: HashMap<RelationKey, usize> = HashMap::new();
+    let mut merged: Vec<RelationEdge> = Vec::new();
+    for part in parts {
+        for edge in part {
+            let key = relation_key(&edge, mode);
+            match seen.get(&key) {
+                None => {
+                    seen.insert(key, merged.len());
+                    merged.push(edge);
+                }
+                Some(&at) => {
+                    // `SpanAndText` items are dicts carrying `confidence`, so
+                    // Python compares real numbers; `TextOnly` items are bare
+                    // tuples, which `_representative_confidence` scores `0.0`
+                    // across the board, so Python never replaces there.
+                    let replaces = match mode {
+                        RelationKeyMode::SpanAndText => edge.score > merged[at].score,
+                        RelationKeyMode::TextOnly => false,
+                    };
+                    if replaces {
+                        merged[at] = edge;
+                    }
+                }
+            }
+        }
+    }
+    merged
 }
 
 /// Collapses what overlapping windows saw twice.
@@ -171,10 +269,23 @@ pub fn remap(output: &mut BoundaryOutput, chunk: &Chunk, text: &str) {
 /// Fields never interact, exactly as in single-window decoding.
 ///
 /// Classifications are collapsed per `(task, label)` by highest score.
+///
+/// Relations are folded by [`merge_relations`], and — this is deliberate —
+/// **independently of mentions**. The seam pass below *deletes* mentions: if
+/// window A saw `Mario` at its edge and window B saw `Mario Rossi` whole, the
+/// wider one wins and A's `founded_by :: Mario | Acme` now names a span that no
+/// surviving mention covers. That edge is kept anyway. `gliner2` never
+/// cross-checks either — `_merge_relation_maps` does not look at `entities` —
+/// and a [`RelationEdge`] carries its own spans and surface text, so it stands
+/// on its own. Adding a referential-integrity filter here would look like a fix
+/// and would in fact be a silent divergence from the reference that no parity
+/// test can catch, because parity is measured on the relation set alone. Do not
+/// add one.
 pub fn merge(parts: Vec<BoundaryOutput>) -> BoundaryOutput {
     let mut mentions: HashMap<(usize, usize, String, String), Mention> = HashMap::new();
     let mut classes: HashMap<(String, String), crate::boundary::Classification> = HashMap::new();
     let mut expected_counts = Vec::new();
+    let mut relation_parts: Vec<Vec<RelationEdge>> = Vec::new();
 
     for part in parts {
         for m in part.mentions {
@@ -196,7 +307,9 @@ pub fn merge(parts: Vec<BoundaryOutput>) -> BoundaryOutput {
             }
         }
         expected_counts.extend(part.expected_counts);
+        relation_parts.push(part.relations);
     }
+    let relations = merge_relations(relation_parts, RelationKeyMode::default());
 
     // Seam pass: greedy by score within each (task, field), spans half-open.
     let mut mentions: Vec<Mention> = mentions.into_values().collect();
@@ -234,12 +347,13 @@ pub fn merge(parts: Vec<BoundaryOutput>) -> BoundaryOutput {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    BoundaryOutput { mentions, classifications, expected_counts }
+    BoundaryOutput { mentions, classifications, expected_counts, relations }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boundary::RelationEndpoint;
 
     #[test]
     fn windows_advance_by_size_minus_overlap() {
@@ -294,11 +408,13 @@ mod tests {
             mentions: vec![men("person", 30, 35, 5, 6, 0.71)],
             classifications: vec![],
             expected_counts: vec![],
+            relations: vec![],
         };
         let b = BoundaryOutput {
             mentions: vec![men("person", 30, 41, 5, 7, 0.97)],
             classifications: vec![],
             expected_counts: vec![],
+            relations: vec![],
         };
         let merged = merge(vec![a, b]);
         assert_eq!(merged.mentions.len(), 1);
@@ -312,13 +428,201 @@ mod tests {
             mentions: vec![men("person", 30, 35, 5, 6, 0.9)],
             classifications: vec![],
             expected_counts: vec![],
+            relations: vec![],
         };
         let b = BoundaryOutput {
             mentions: vec![men("person", 36, 41, 6, 7, 0.9)],
             classifications: vec![],
             expected_counts: vec![],
+            relations: vec![],
         };
         assert_eq!(merge(vec![a, b]).mentions.len(), 2);
+    }
+
+    fn endpoint(text: &str, cs: usize, ce: usize, ws: usize, we: usize) -> RelationEndpoint {
+        RelationEndpoint {
+            text: text.into(),
+            char_start: cs,
+            char_end: ce,
+            word_start: ws,
+            word_end: we,
+        }
+    }
+
+    fn edge(
+        relation: &str,
+        score: f32,
+        head: RelationEndpoint,
+        tail: RelationEndpoint,
+    ) -> RelationEdge {
+        RelationEdge { relation: relation.into(), score, head, tail }
+    }
+
+    fn out(mentions: Vec<Mention>, relations: Vec<RelationEdge>) -> BoundaryOutput {
+        BoundaryOutput { mentions, classifications: vec![], expected_counts: vec![], relations }
+    }
+
+    #[test]
+    fn remap_shifts_relation_endpoints() {
+        // bytes: zero 0..4, one 5..8, Mario 9..14, Rossi 15..20, works 21..26,
+        //        for 27..30, Acme 31..35.
+        let text = "zero one Mario Rossi works for Acme";
+        let chunk = Chunk { byte_start: 9, byte_end: 35, word_start: 2, word_end: 7 };
+        // Window-local coordinates, as a scorer running on that window emits
+        // them. The tail's surface text is deliberately stale, so the test also
+        // proves remap re-slices instead of trusting the window's copy.
+        let mut output = out(
+            vec![],
+            vec![edge(
+                "works_for: person works at an organization",
+                0.9,
+                endpoint("Mario Rossi", 0, 11, 0, 2),
+                endpoint("cme", 22, 26, 4, 5),
+            )],
+        );
+        remap(&mut output, &chunk, text);
+        let r = &output.relations[0];
+        assert_eq!((r.head.char_start, r.head.char_end), (9, 20));
+        assert_eq!((r.head.word_start, r.head.word_end), (2, 4));
+        assert_eq!(r.head.text, "Mario Rossi");
+        assert_eq!((r.tail.char_start, r.tail.char_end), (31, 35), "the tail shifts too");
+        assert_eq!((r.tail.word_start, r.tail.word_end), (6, 7), "the tail shifts too");
+        assert_eq!(r.tail.text, "Acme", "the surface text is re-sliced, not trusted");
+    }
+
+    #[test]
+    fn merge_relations_keeps_first_on_tie() {
+        // Same canonical key, same score, different word coordinates — which
+        // are not part of the key, so they reveal which copy survived.
+        let a = edge("works_for", 0.5, endpoint("A", 0, 1, 0, 1), endpoint("B", 2, 3, 1, 2));
+        let b = edge("works_for", 0.5, endpoint("A", 0, 1, 40, 41), endpoint("B", 2, 3, 41, 42));
+        let merged = merge_relations(vec![vec![a], vec![b]], RelationKeyMode::default());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].head.word_start, 0, "only a strictly greater score replaces");
+    }
+
+    #[test]
+    fn merge_relations_prefers_strictly_higher_score() {
+        let lo = edge("works_for", 0.5, endpoint("A", 0, 1, 0, 1), endpoint("B", 2, 3, 1, 2));
+        let hi = edge("works_for", 0.9, endpoint("A", 0, 1, 0, 1), endpoint("B", 2, 3, 1, 2));
+        let up =
+            merge_relations(vec![vec![lo.clone()], vec![hi.clone()]], RelationKeyMode::default());
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0].score, 0.9, "a later, better duplicate replaces the incumbent");
+        let down = merge_relations(vec![vec![hi], vec![lo]], RelationKeyMode::default());
+        assert_eq!(down.len(), 1);
+        assert_eq!(down[0].score, 0.9, "a later, worse duplicate does not");
+    }
+
+    #[test]
+    fn merge_relations_preserves_first_seen_order() {
+        let x = edge("works_for", 0.5, endpoint("X", 0, 1, 0, 1), endpoint("P", 2, 3, 1, 2));
+        let y = edge("works_for", 0.5, endpoint("Y", 4, 5, 2, 3), endpoint("P", 2, 3, 1, 2));
+        let x_better = edge("works_for", 0.9, endpoint("X", 0, 1, 0, 1), endpoint("P", 2, 3, 1, 2));
+        let merged = merge_relations(vec![vec![x, y], vec![x_better]], RelationKeyMode::default());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].head.text, "X", "a replaced entry keeps its original position");
+        assert_eq!(merged[0].score, 0.9);
+        assert_eq!(merged[1].head.text, "Y");
+    }
+
+    #[test]
+    fn merge_relations_keys_on_the_relation_name() {
+        let a = edge("works_for", 0.5, endpoint("A", 0, 1, 0, 1), endpoint("B", 2, 3, 1, 2));
+        let mut b = a.clone();
+        b.relation = "founded_by".into();
+        let merged = merge_relations(vec![vec![a, b]], RelationKeyMode::default());
+        assert_eq!(merged.len(), 2, "two relation types over one pair are two edges");
+    }
+
+    #[test]
+    fn merge_relations_text_only_mode_ignores_spans() {
+        // The same pair of surface forms at two different places in the text.
+        let first =
+            edge("works_for", 0.5, endpoint("Mario", 0, 5, 0, 1), endpoint("Acme", 10, 14, 2, 3));
+        let second =
+            edge("works_for", 0.4, endpoint("Mario", 20, 25, 4, 5), endpoint("Acme", 30, 34, 6, 7));
+        let spanned = merge_relations(
+            vec![vec![first.clone(), second.clone()]],
+            RelationKeyMode::SpanAndText,
+        );
+        assert_eq!(spanned.len(), 2, "spans are part of the default key");
+        let flat = merge_relations(vec![vec![first, second]], RelationKeyMode::TextOnly);
+        assert_eq!(flat.len(), 1, "text-only keys collapse the two occurrences");
+        assert_eq!(flat[0].head.char_start, 0);
+    }
+
+    #[test]
+    fn merge_relations_text_only_never_replaces_the_first_seen() {
+        // The bare `(head, tail)` tuple carries no confidence, so Python's
+        // `_representative_confidence` returns 0.0 for both sides and the
+        // replacement branch is unreachable: first seen wins even when a later
+        // duplicate scores far higher. `SpanAndText` is the contrast — there the
+        // items are dicts with a `confidence`, so the better one does replace.
+        let weak_first =
+            edge("works_for", 0.1, endpoint("Mario", 0, 5, 0, 1), endpoint("Acme", 10, 14, 2, 3));
+        let strong_later =
+            edge("works_for", 0.9, endpoint("Mario", 20, 25, 4, 5), endpoint("Acme", 30, 34, 6, 7));
+        let flat = merge_relations(
+            vec![vec![weak_first.clone()], vec![strong_later.clone()]],
+            RelationKeyMode::TextOnly,
+        );
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].score, 0.1, "a higher score does not replace under TextOnly");
+        assert_eq!(flat[0].head.char_start, 0, "the first occurrence is the survivor");
+
+        // Same two edges, same spans, differing only in score, under the
+        // default mode: here the strictly greater score does replace.
+        let mut same_span = strong_later;
+        same_span.head = weak_first.head.clone();
+        same_span.tail = weak_first.tail.clone();
+        let spanned =
+            merge_relations(vec![vec![weak_first], vec![same_span]], RelationKeyMode::SpanAndText);
+        assert_eq!(spanned.len(), 1);
+        assert_eq!(spanned[0].score, 0.9, "SpanAndText still replaces on a better score");
+    }
+
+    #[test]
+    fn merge_folds_a_relation_two_windows_both_saw() {
+        let e = |score| {
+            edge(
+                "works_for",
+                score,
+                endpoint("Mario Rossi", 30, 41, 5, 7),
+                endpoint("Acme", 50, 54, 9, 10),
+            )
+        };
+        let merged = merge(vec![out(vec![], vec![e(0.61)]), out(vec![], vec![e(0.93)])]);
+        assert_eq!(merged.relations.len(), 1);
+        assert_eq!(merged.relations[0].score, 0.93);
+    }
+
+    #[test]
+    fn relation_outlives_its_endpoint_mention() {
+        // Window A saw the truncated `Mario` [5,6) and hung an edge off it;
+        // window B saw `Mario Rossi` [5,7) whole. The seam pass deletes A's
+        // mention. The edge must survive anyway: gliner2's
+        // `_merge_relation_maps` never consults the entity set, and a filter
+        // here would be a divergence no parity test could catch.
+        let a = out(
+            vec![men("person", 30, 35, 5, 6, 0.71)],
+            vec![edge(
+                "works_for",
+                0.8,
+                endpoint("Mario", 30, 35, 5, 6),
+                endpoint("Acme", 50, 54, 9, 10),
+            )],
+        );
+        let b = out(vec![men("person", 30, 41, 5, 7, 0.97)], vec![]);
+        let merged = merge(vec![a, b]);
+        assert_eq!(merged.mentions.len(), 1, "the seam pass keeps only the wider mention");
+        assert_eq!(merged.mentions[0].word_end, 7);
+        assert!(
+            !merged.mentions.iter().any(|m| m.char_end == 35),
+            "the mention the edge names really is gone"
+        );
+        assert_eq!(merged.relations.len(), 1, "the edge outlives it");
+        assert_eq!(merged.relations[0].head.char_end, 35);
     }
 
     #[test]

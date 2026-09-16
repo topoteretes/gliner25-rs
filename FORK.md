@@ -230,6 +230,62 @@ cargo test -p gliner25-rs --test cognee_contract -- --nocapture
 
 ---
 
+## Delta 4 — `BoundaryOutput` carries relations through chunking
+
+**Files:** `crates/gliner25-rs/src/boundary.rs`,
+`crates/gliner25-rs/src/chunker.rs`, `crates/gliner25-rs/src/families.rs`,
+`crates/gliner25-rs/src/lib.rs`.
+
+Upstream decodes relations *after* merging the windows, from merged mention
+text alone (`boundary::pair_relations`, a type-compatible cartesian product).
+That is wrong for a document: it manufactures edges spanning hundreds of words.
+`gliner2` instead scores relations **inside each window** and merges the decoded
+edges (`inference/chunking.py::_merge_relation_maps`), and it has no choice —
+the model's relation scorer indexes both endpoints against one padded length, so
+a pair whose ends live in different windows has no shared frame at all.
+
+This delta is the plumbing for that ordering; the scorer itself is a later
+change. Added:
+
+- `boundary::RelationEndpoint` and `boundary::RelationEdge` — self-contained
+  span + surface text for each end, plus the relation's `prompt_str` and a
+  score.
+- `BoundaryOutput.relations: Vec<RelationEdge>`. The struct already derives
+  `Default`, and `boundary.rs`'s own construction site already spread it, so
+  only the six literal sites needed touching: five in `chunker.rs` (one in
+  `merge`, four in its tests) and one in `families.rs` — where the merge body
+  was split out of `run_families` into a model-free `merge_family_outputs`, so
+  that the fold is reachable from a test without a model behind it.
+- `chunker::remap` shifts both endpoints of every edge by `chunk.byte_start` /
+  `chunk.word_start` and re-slices their surface text, mirroring what it
+  already does for mentions.
+- `chunker::merge_relations` + `chunker::RelationKeyMode`, a port of the
+  non-span branch of `_dedupe_items` (`chunking.py`): a canonical key with the
+  score stripped, first-seen insertion order, and replacement only on a
+  **strictly** greater score. `RelationKeyMode::SpanAndText` is the default
+  because the checked-in Python reference (`tests/fixtures/py_reference.json`)
+  was produced with `include_spans=True`; `TextOnly` reproduces the bare
+  `(head, tail)` shape for a caller that asks for neither spans nor confidence.
+  The survivor rule is mode-dependent, because Python's is: a tuple is neither a
+  `dict` nor a `list`, so `_representative_confidence` scores every `TextOnly`
+  item `0.0` and the incumbent is **never** replaced, whatever the scores.
+- Families run every pass over the *same* text, so their outputs share one
+  coordinate frame and `merge_family_outputs` folds their relations with
+  `merge_relations` too, rather than discarding them.
+
+**One behaviour worth naming, because it looks like a bug.** `merge`'s seam
+pass deletes mentions, so it can delete a mention that a relation from another
+window points at. Those relations are kept anyway — `_merge_relation_maps`
+never consults the entity set either, and an edge carries its own spans and
+text. A referential-integrity filter here would be a divergence invented by the
+fork that no parity test could catch. `merge`'s doc comment says so, and
+`chunker::tests::relation_outlives_its_endpoint_mention` pins it.
+
+Nothing produces relations yet, so `BoundaryOutput.relations` is empty on every
+path today and no existing behaviour changes. `pair_relations` is untouched.
+
+---
+
 ## Deliberately not changed
 
 - **Formatting.** Upstream's tree is not `cargo fmt`-clean under default
