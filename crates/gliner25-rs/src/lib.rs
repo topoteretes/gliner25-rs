@@ -58,9 +58,9 @@ pub mod families;
 
 pub use boundary::{
     BoundaryConfig, BoundaryEngine, BoundaryManifest, BoundaryOutput, BoundaryParams,
-    Classification, Mention, RelationEdge, RelationEndpoint, pair_relations,
+    Classification, Mention, RelationEdge, RelationEndpoint, RelationScoreInputs, pair_relations,
 };
-pub use chain::ExecutionMode;
+pub use chain::{Carrier, ExecutionMode};
 pub use chunker::{Chunker, RelationKeyMode};
 pub use error::GlinerError;
 pub use overlap::{OverlapPolicy, Spanned, resolve_overlaps};

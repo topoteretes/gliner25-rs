@@ -66,6 +66,13 @@ pub struct BoundaryManifest {
     pub enable_count_head: bool,
     pub overlap_policy: String,
     pub max_position_embeddings: usize,
+    /// `true` when the export carries `relation_scorer_{fp32,fp16,…}.onnx`.
+    ///
+    /// Defaulted rather than required: every export written before the relation
+    /// scorer existed lacks the key, and an engine that only extracts entities
+    /// must keep loading those.
+    #[serde(default)]
+    pub enable_relation_scorer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +316,9 @@ pub struct BoundaryEngine {
     classifier: Session,
     /// Heads by bucket, ascending. `None` until first needed.
     heads: Vec<(usize, Option<Session>)>,
+    /// The relation scorer. Loaded on first use like a head, and for the same
+    /// reason: an entity-only run must not pay for 23 MB it never touches.
+    relation_scorer: Option<Session>,
 
     transformer: SchemaTransformer,
     chain: Chain,
@@ -425,6 +435,7 @@ impl BoundaryEngine {
             routed_gather: load("routed_gather")?,
             classifier: load("classifier")?,
             heads,
+            relation_scorer: None,
             transformer,
             manifest,
             dtype: config.precision.io_dtype(),
@@ -813,6 +824,253 @@ impl BoundaryEngine {
     /// fallback a device OOM forced.
     pub fn execution(&self) -> ExecutionMode {
         self.chain.mode()
+    }
+}
+
+/// Inputs to the `relation_scorer` fragment, for a single window.
+///
+/// Batch is 1, as in every other fragment: `L = padded_words`,
+/// `R = relations`, `P = pairs.len()`. The graph declares all three as free
+/// symbolic dimensions — the relation scorer has **no length buckets**, unlike
+/// the boundary head.
+pub struct RelationScoreInputs<'a> {
+    /// `[1, padded_words, hidden_size]`, exactly as `routed_gather` produced
+    /// it. The padded rows are **zero**: `routed_gather` returns
+    /// `states * mask`, so everything past the word count is 0.0.
+    pub text_states: &'a Carrier,
+    /// Dim 1 of `text_states` — the length bucket the window was padded to
+    /// (64/128/256/512), *not* the word count.
+    pub padded_words: usize,
+    /// `[relations * hidden_size]`, row-major: the **head** role's query state
+    /// for each relation type, in the order `pairs`'s `relation_index` uses.
+    pub relation_query_head: &'a [f32],
+    /// `[relations * hidden_size]` — the **tail** role's half. The graph
+    /// concatenates the two halves itself into the
+    /// `relation_query_dim = 1536` state (`model.py:1397-1401`), so keep them
+    /// separate here rather than pre-concatenating.
+    pub relation_query_tail: &'a [f32],
+    /// `R`. Pairs whose `relation_index` falls outside `0..R` score exactly
+    /// `0.0` — not `-inf` (`relations.py:407`).
+    pub relations: usize,
+    /// The proposal set, in [`generate_pairs`](crate::relations::generate_pairs)
+    /// order, already compacted. **Scoring is a no-op when this is empty** —
+    /// see the `P = 0` guard in [`BoundaryEngine::score_relation_pairs`].
+    pub pairs: &'a [crate::relations::ProposedPair],
+    /// The denominator of `dist = |tail_start - head_start| / text_len`
+    /// (`relations.py:374`), lifted out of the graph because `float()` on a
+    /// `SymInt` would have baked the tracing length in.
+    ///
+    /// **Feed the window's own word count, not [`Self::padded_words`].** The
+    /// reasoning, and the Python measurement behind it, are at the call site in
+    /// [`BoundaryEngine::score_relation_pairs`]; feeding the bucket instead
+    /// shifts every relation logit by ~1e-01 while every existing test stays
+    /// green.
+    pub text_len: usize,
+}
+
+impl BoundaryEngine {
+    /// Scores proposed relation pairs with the `relation_scorer` fragment.
+    ///
+    /// Returns one **raw logit** per pair, in `inputs.pairs` order. Decoding is
+    /// deliberately not done here: `sigmoid(logit / relation_temperature)`, the
+    /// 0.5 abstention threshold — which is a different knob from the 0.2
+    /// argument-proposal threshold the pairs were selected with — and edge
+    /// de-duplication all belong to the caller.
+    ///
+    /// ## The `P = 0` guard
+    ///
+    /// An empty proposal set returns `Ok(vec![])` **without touching the
+    /// session**. That is not an optimisation. `num_pairs >= 1` was baked into
+    /// the graph at tracing time, and onnxruntime fails inside `node_add_163`
+    /// ("Can broadcast 0 by 0 or 1. 768 is invalid") when fed `P = 0`; Python
+    /// never reaches the model either, early-returning at
+    /// `boundary/engine.py:818-819` and again at `relations.py:335-336`.
+    ///
+    /// The guard is on the **compacted pair list**, i.e. after `same_span` and
+    /// after compaction, and it has to be: a guard on the *argument pool*
+    /// answers the same way on a pool that was empty to begin with, and the
+    /// wrong way when a head and a tail both survive selection and `same_span`
+    /// kills the only pair they could form. Both routes to `P = 0` are in the
+    /// fixture, and only the second one distinguishes the placements.
+    ///
+    /// ## Precision
+    ///
+    /// The fragment follows the engine's precision like every other one. The
+    /// fp16 margin against the 2e-2 probability tolerance **narrows with the
+    /// padded length** — 20.6× at `L = 64`, 18.2× at `L = 128`, 8.6× at
+    /// `L = 512` — so an export run at the 512 bucket has the least headroom.
+    /// (Span depth does not order the error; only length does.)
+    pub fn score_relation_pairs(&mut self, inputs: RelationScoreInputs<'_>) -> Result<Vec<f32>> {
+        // ── the P = 0 guard, before anything else ─────────────────────────
+        if inputs.pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // `relations.py:341-343`: with no relation queries every pair scores
+        // 0.0 rather than running the model. The graph cannot run `R = 0`
+        // either — `safe_relation_indices` is inlined as `clamp(0, R - 1)`.
+        if inputs.relations == 0 {
+            return Ok(vec![0.0; inputs.pairs.len()]);
+        }
+
+        let hidden = self.manifest.hidden_size;
+        let want = inputs.relations * hidden;
+        if inputs.relation_query_head.len() != want || inputs.relation_query_tail.len() != want {
+            return Err(anyhow!(
+                "relation query states must hold {want} floats each ({} relations x {hidden} \
+                 hidden), got head {} and tail {}",
+                inputs.relations,
+                inputs.relation_query_head.len(),
+                inputs.relation_query_tail.len(),
+            ));
+        }
+        if inputs.text_len == 0 || inputs.text_len > inputs.padded_words {
+            return Err(anyhow!(
+                "text_len {} is not a word count inside the padded length {} — it is the \
+                 window's own word count, not the bucket and not an arbitrary number",
+                inputs.text_len,
+                inputs.padded_words,
+            ));
+        }
+
+        let p = inputs.pairs.len();
+        let mut relation_index = Vec::with_capacity(p);
+        let mut head_start = Vec::with_capacity(p);
+        let mut head_end = Vec::with_capacity(p);
+        let mut tail_start = Vec::with_capacity(p);
+        let mut tail_end = Vec::with_capacity(p);
+        for pair in inputs.pairs {
+            relation_index.push(pair.relation_index as i64);
+            head_start.push(pair.head_start as i64);
+            head_end.push(pair.head_end as i64);
+            tail_start.push(pair.tail_start as i64);
+            tail_end.push(pair.tail_end as i64);
+        }
+
+        // ── why `text_len` is the WORD COUNT and not `padded_words` ───────
+        //
+        // `text_len` is the one channel through which padding reaches a
+        // relation score. Everything else in the fragment is padding-blind:
+        // `routed_gather` zeroes the padded rows, and every span is bounded by
+        // the word count, so no `prefix[end] - prefix[start]` in the biaffine
+        // branch ever straddles padding. Measured, not assumed — states padded
+        // to 97 rows with `text_len = 41` reproduce PyTorch-at-41 to 1.2e-06,
+        // while `text_len = 97` on the same states moves the logits by 7.8e-02.
+        //
+        // Python takes the denominator from `boundary_states.shape[1]`
+        // (`relations.py:355`), which is `pad_sequence(..., batch_first=True)`
+        // over the collated batch (`model.py:1433` -> `_pad_states`) — the
+        // batch maximum, not a bucket. Measured on cognee's own call
+        // (`batch_extract_long(..., batch_size=16, chunk_size=384,
+        // chunk_overlap=64)`) over the four parity scenarios, by spying on
+        // `_decode_relations`:
+        //
+        //     scenario    batch  padded L  this window's words
+        //     short         1       18            18
+        //     medium        1       81            81
+        //     long          1      384           384
+        //     very_long     3      384      384 / 384 / 235
+        //
+        // So Python's denominator equals the window's own word count in five of
+        // the six windows, and differs only for the short tail window of a
+        // multi-chunk document, where it inherits 384 from its batch-mates.
+        //
+        // Rust pads to a 64/128/256/512 bucket, which matches Python in **none**
+        // of those six windows (64/128/512/512/512/256). Feeding the bucket
+        // would therefore be wrong everywhere; feeding the word count is right
+        // wherever Python is effectively at batch 1, which is every
+        // single-window document and every full window of a long one.
+        //
+        // The remaining alternative — reproducing Python's batch maximum — was
+        // rejected: it makes a window's relation scores depend on which other
+        // windows happen to share its batch, which is an artifact of Python's
+        // collation rather than a property of the model, and this engine runs
+        // one window per session call.
+        let text_len = inputs.text_len as f32;
+
+        self.ensure_relation_scorer()?;
+        let pair_dim = vec![p as i64];
+        let query_dim = vec![1, inputs.relations as i64, hidden as i64];
+        let logits = {
+            // `chain` and the session are separate fields, so they can be
+            // borrowed together — the same reason `extract_once` copies the
+            // head out by slot instead of through a method.
+            let chain = &self.chain;
+            let dtype = self.dtype;
+            let session = self
+                .relation_scorer
+                .as_mut()
+                .expect("ensure_relation_scorer just loaded it");
+            let mut out = chain.run(
+                session,
+                &[
+                    Feed::Carried(
+                        inputs.text_states,
+                        vec![1, inputs.padded_words as i64, hidden as i64],
+                    ),
+                    Feed::Owned(crate::runtime::float_tensor(
+                        dtype,
+                        query_dim.clone(),
+                        inputs.relation_query_head.to_vec(),
+                    )?),
+                    Feed::Owned(crate::runtime::float_tensor(
+                        dtype,
+                        query_dim,
+                        inputs.relation_query_tail.to_vec(),
+                    )?),
+                    Feed::Owned(i64_tensor(pair_dim.clone(), relation_index)?),
+                    Feed::Owned(i64_tensor(pair_dim.clone(), head_start)?),
+                    Feed::Owned(i64_tensor(pair_dim.clone(), head_end)?),
+                    Feed::Owned(i64_tensor(pair_dim.clone(), tail_start)?),
+                    Feed::Owned(i64_tensor(pair_dim, tail_end)?),
+                    Feed::Owned(crate::runtime::float_tensor(
+                        dtype,
+                        vec![1],
+                        vec![text_len],
+                    )?),
+                ],
+                &[Sink::Host],
+            )?;
+            out.remove(0).host(dtype)?
+        };
+
+        if logits.len() != p {
+            return Err(anyhow!(
+                "relation_scorer returned {} logits for {p} pairs",
+                logits.len()
+            ));
+        }
+        Ok(logits)
+    }
+
+    /// Loads the relation scorer if it is not loaded yet.
+    ///
+    /// Separate from [`Self::score_relation_pairs`] so the `P = 0` guard can
+    /// run before it: an empty proposal set must cost nothing, including on an
+    /// export that never shipped the fragment.
+    fn ensure_relation_scorer(&mut self) -> Result<()> {
+        if self.relation_scorer.is_some() {
+            return Ok(());
+        }
+        if !self.manifest.enable_relation_scorer {
+            return Err(GlinerError::IncompleteModelDir(format!(
+                "the manifest in {} does not declare enable_relation_scorer, so this export \
+                 predates the relation scorer and cannot score relation pairs",
+                self.dir.display(),
+            ))
+            .into());
+        }
+        let path =
+            resolve_fragment(&self.dir, "relation_scorer", self.precision).ok_or_else(|| {
+                GlinerError::IncompleteModelDir(format!(
+                    "fragment 'relation_scorer{}' not found in {} nor in {}/",
+                    self.precision.suffix(),
+                    self.dir.display(),
+                    self.precision.legacy_subdir(),
+                ))
+            })?;
+        self.relation_scorer = Some(build_session(&path, self.intra_threads)?);
+        Ok(())
     }
 }
 
