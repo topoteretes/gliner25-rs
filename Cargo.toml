@@ -36,9 +36,39 @@ homepage = "https://edito-pdf.com"
 # `try_extract_tensor` started returning a `Shape`, and `Outlet`'s fields went
 # private. A future rc can break the build the same way. Pin exactly in your own
 # application if you need the guarantee; a library should not impose it.
+#
+# COGNEE FORK DELTA. Upstream's list was:
+#
+#     features = ["std", "ndarray", "load-dynamic",
+#                 "cuda", "rocm", "coreml", "openvino", "directml",
+#                 "tensorrt", "xnnpack", "qnn", "half"]
+#
+# Only `std`, `ndarray` and `half` stay unconditional. `load-dynamic` and the
+# eight execution-provider features moved behind `gliner25-rs`'s own cargo
+# features, all off by default — see `[features]` in
+# `crates/gliner25-rs/Cargo.toml`, and FORK.md for the full rationale.
+#
+# The reason is Cargo feature unification. `ort/load-dynamic` pulls
+# `ort-sys/disable-linking`, and features are additive across a whole build
+# graph: a binary that links this crate *and* another `ort` consumer that
+# expects a downloaded or system-linked ONNX Runtime ends up with neither. In
+# cognee that consumer is `cognee-embedding`'s `onnx` backend, whose
+# `ort::init().commit()` sits behind an `.expect(...)`, so it would panic at
+# startup in every wheel, Node addon, C staticlib and CLI that ships it.
+# Enabling the feature stays a one-flag decision for a caller that genuinely
+# wants to load a dylib at run time.
+#
+# `download-binaries` + `tls-rustls` replace what `load-dynamic` used to
+# provide. Upstream never needed them: `load-dynamic` implies
+# `ort-sys/disable-linking`, so `OrtGetApiBase` was resolved from a dylib at
+# run time and nothing had to be linked. Drop `load-dynamic` with nothing in
+# its place and every binary fails to link with `undefined symbol:
+# OrtGetApiBase`. `download-binaries` is also the mode `cognee-embedding`'s
+# `onnx` backend already builds in, so this is the link mode the two agree on
+# by default. `tls-rustls`, not ort's default `tls-native`, for the same
+# reason the `hf-hub` entry below picks `ureq`: no `openssl`.
 ort = { version = "2.0.0-rc.13", default-features = false, features = [
-    "std", "ndarray", "load-dynamic",
-    "cuda", "rocm", "coreml", "openvino", "directml", "tensorrt", "xnnpack", "qnn", "half",
+    "std", "ndarray", "half", "download-binaries", "tls-rustls",
 ] }
 ndarray = "0.17"
 

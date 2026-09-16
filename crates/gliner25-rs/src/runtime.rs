@@ -20,7 +20,20 @@
 
 use anyhow::{Context, Result, anyhow};
 use half::f16;
-use ort::ep::{self, ExecutionProviderDispatch};
+use ort::ep::ExecutionProviderDispatch;
+// COGNEE FORK DELTA: the `ort::ep::{CUDA, ROCm, …}` types are themselves gated
+// behind `ort`'s per-provider features, which are now opt-in (see FORK.md), so
+// the module import only exists when at least one of them is compiled in.
+#[cfg(any(
+    feature = "cuda",
+    feature = "tensorrt",
+    feature = "rocm",
+    feature = "coreml",
+    feature = "directml",
+    feature = "openvino",
+    feature = "xnnpack",
+))]
+use ort::ep;
 use ort::session::Session;
 use ort::session::builder::SessionBuilder;
 use ort::value::{DynValue, Tensor};
@@ -192,20 +205,42 @@ pub fn execution_providers() -> Vec<ExecutionProviderDispatch> {
         None => (requested.clone(), 0),
     };
 
+    // COGNEE FORK DELTA: one `#[cfg]` per arm, because each `ep::*` type only
+    // exists when its `ort` feature is on and those are opt-in here. With every
+    // provider feature enabled this matches upstream arm for arm. With one off,
+    // its device name falls through to the catch-all and runs on CPU — the same
+    // outcome as asking for a provider whose shared library is missing.
+    #[cfg(not(any(feature = "cuda", feature = "tensorrt")))]
+    let _ = device_id;
     match name.trim().to_lowercase().as_str() {
         "cpu" => Vec::new(),
+        #[cfg(feature = "cuda")]
         "cuda" | "auto" => vec![ep::CUDA::default().with_device_id(device_id).build()],
+        // `auto` must still be a recognised value when CUDA is not compiled in:
+        // it is what an unset `GLINER2_DEVICE` resolves to, so warning about it
+        // would print on every default run.
+        #[cfg(not(feature = "cuda"))]
+        "auto" => Vec::new(),
+        #[cfg(feature = "tensorrt")]
         "tensorrt" => vec![
             ep::TensorRT::default().build(),
             ep::CUDA::default().with_device_id(device_id).build(),
         ],
+        #[cfg(feature = "rocm")]
         "rocm" => vec![ep::ROCm::default().build()],
+        #[cfg(feature = "coreml")]
         "coreml" => vec![ep::CoreML::default().build()],
+        #[cfg(feature = "directml")]
         "directml" => vec![ep::DirectML::default().build()],
+        #[cfg(feature = "openvino")]
         "openvino" => vec![ep::OpenVINO::default().build()],
+        #[cfg(feature = "xnnpack")]
         "xnnpack" => vec![ep::XNNPACK::default().build()],
         other => {
-            eprintln!("GLINER2_DEVICE={other} not recognised, running on CPU");
+            eprintln!(
+                "GLINER2_DEVICE={other} not available in this build \
+                 (unrecognised, or its gliner25-rs feature is off), running on CPU"
+            );
             Vec::new()
         }
     }
@@ -231,20 +266,33 @@ pub fn device_id() -> i32 {
 /// optimisers that run on it have nothing to bind: their "device memory" is
 /// host memory, so binding would add bookkeeping and save no copy.
 pub fn provider_has_device_memory() -> bool {
-    matches!(
-        requested_device().0.as_str(),
-        "cuda" | "auto" | "tensorrt" | "rocm" | "directml"
-    )
+    // COGNEE FORK DELTA: a device name only implies device memory if that
+    // provider was actually compiled in. Upstream could answer from the string
+    // alone because every provider was always present; here a build with the
+    // features off would otherwise pick `IoBinding` for a session that is
+    // running on CPU. With all features on this is upstream's `matches!`.
+    match requested_device().0.as_str() {
+        "cuda" | "auto" => cfg!(feature = "cuda"),
+        "tensorrt" => cfg!(feature = "tensorrt"),
+        "rocm" => cfg!(feature = "rocm"),
+        "directml" => cfg!(feature = "directml"),
+        _ => false,
+    }
 }
 
 /// The ORT allocation device matching the configured provider.
 pub fn allocation_device() -> ort::memory::AllocationDevice {
     use ort::memory::AllocationDevice;
+    // COGNEE FORK DELTA: same reasoning as `provider_has_device_memory` — the
+    // guards keep this consistent with what `execution_providers` registered.
+    // With every provider feature on, the guards are all true and this is
+    // upstream's mapping unchanged.
     match requested_device().0.as_str() {
-        "rocm" => AllocationDevice::HIP,
-        "directml" => AllocationDevice::DIRECTML,
+        "rocm" if cfg!(feature = "rocm") => AllocationDevice::HIP,
+        "directml" if cfg!(feature = "directml") => AllocationDevice::DIRECTML,
         // CUDA also backs the TensorRT provider, which falls back to it.
-        "cuda" | "auto" | "tensorrt" => AllocationDevice::CUDA,
+        "cuda" | "auto" if cfg!(feature = "cuda") => AllocationDevice::CUDA,
+        "tensorrt" if cfg!(feature = "tensorrt") => AllocationDevice::CUDA,
         _ => AllocationDevice::CPU,
     }
 }

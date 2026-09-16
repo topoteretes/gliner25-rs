@@ -42,3 +42,51 @@ hub = ["dep:hf-hub"]
 # Helpers that locate a tokenizer.json under the workspace, for pinning the
 # prompt layout against the same ground truth from outside the crate.
 test-support = []
+
+# --- COGNEE FORK DELTA: ONNX Runtime link mode and execution providers -------
+#
+# Upstream enabled `ort/load-dynamic` plus eight execution-provider features
+# unconditionally, from the workspace `ort` entry. Cargo features are additive
+# per build graph, so those choices were imposed on every crate that linked
+# this one. They are opt-in here, all off by default. See FORK.md.
+#
+# Nothing below changes behaviour when it is left off: with no EP feature the
+# crate registers no provider and ONNX Runtime runs on CPU, which is what
+# `GLINER2_DEVICE=cpu` already did upstream.
+
+# Resolve `libonnxruntime` at run time (`ORT_DYLIB_PATH`) instead of linking
+# it. Pulls `ort-sys/disable-linking`, which makes `ort-sys`'s build script
+# return early: with this on, *nothing* downloads or links ONNX Runtime for
+# the whole build graph, so a co-linked consumer such as
+# `cognee-embedding/onnx` would panic in `ort::init().commit()`. Turn it on
+# only when every `ort` consumer in the artifact agrees to load a dylib.
+load-dynamic = ["ort/load-dynamic"]
+
+# Execution providers. Each one gates both `ort`'s provider bindings and the
+# matching `GLINER2_DEVICE` arm in `runtime.rs`; an arm whose feature is off
+# falls through to CPU with a message. Registering a provider is a request,
+# not a guarantee — see `runtime::execution_providers`.
+#
+# Linking caveat, inherited from `ort` and not introduced here. With the
+# default `download-binaries`, `ort-sys` has to find a prebuilt distribution
+# matching the exact requested provider set for the target triple. On
+# x86_64-unknown-linux-gnu only `cuda` and `tensorrt` resolve; `rocm`,
+# `coreml`, `openvino`, `directml`, `xnnpack` and `qnn` have no dist there and
+# fail at link time with `undefined symbol: OrtGetApiBase`. Upstream never hit
+# this because `load-dynamic` skipped dist resolution entirely. So enable a
+# provider together with `load-dynamic`, or point `ORT_LIB_LOCATION` at an
+# ONNX Runtime build that has it. `--features load-dynamic,cuda,rocm,coreml,
+# openvino,directml,tensorrt,xnnpack,qnn` reproduces upstream's build exactly.
+cuda = ["ort/cuda"]
+rocm = ["ort/rocm"]
+coreml = ["ort/coreml"]
+openvino = ["ort/openvino"]
+directml = ["ort/directml"]
+xnnpack = ["ort/xnnpack"]
+# QNN has no `GLINER2_DEVICE` arm upstream or here; the feature exists so a
+# caller can still build the bindings in.
+qnn = ["ort/qnn"]
+# TensorRT pulls `cuda` deliberately: `GLINER2_DEVICE=tensorrt` registers
+# TensorRT *and* CUDA behind it, because TensorRT falls back to CUDA. Enabling
+# `tensorrt` alone would leave that arm unable to build its fallback.
+tensorrt = ["ort/tensorrt", "cuda"]
