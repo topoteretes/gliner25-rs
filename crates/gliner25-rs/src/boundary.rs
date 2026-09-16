@@ -73,6 +73,63 @@ pub struct BoundaryManifest {
     /// must keep loading those.
     #[serde(default)]
     pub enable_relation_scorer: bool,
+    /// `boundary_settings.relation_temperature`. Divides the relation logit
+    /// before the sigmoid (`engine.py:832-834`).
+    #[serde(default)]
+    pub relation_temperature: Option<f32>,
+    /// `relation_heads_per_type`. Checkpoint: 32.
+    #[serde(default)]
+    pub relation_heads_per_type: Option<usize>,
+    /// `relation_tails_per_type`. Checkpoint: 32.
+    #[serde(default)]
+    pub relation_tails_per_type: Option<usize>,
+    /// `relation_pair_cap`. Checkpoint: **64**; the library default is 128.
+    #[serde(default)]
+    pub relation_pair_cap: Option<usize>,
+    /// `relation_argument_proposal_threshold`. Checkpoint: **0.2**; the library
+    /// default is 0.0. This is the threshold on the *argument pool*, never the
+    /// decode threshold.
+    #[serde(default)]
+    pub relation_argument_proposal_threshold: Option<f32>,
+}
+
+impl BoundaryManifest {
+    /// The four proposal knobs, or an error naming the missing key.
+    ///
+    /// Deliberately **not** defaulted to
+    /// [`RelationProposalSettings::checkpoint`]: two of the four disagree with
+    /// the `gliner2` library defaults, and a silent fallback is exactly how the
+    /// wrong pair cap gets back in without failing anything.
+    pub fn relation_proposal_settings(&self) -> Result<crate::relations::RelationProposalSettings> {
+        let missing = |key: &str| {
+            anyhow!(
+                "boundary_manifest.json in this export declares enable_relation_scorer but \
+                 not `{key}`; re-export with export_boundary_v1.py rather than falling back \
+                 to the gliner2 library defaults, two of which disagree with this checkpoint"
+            )
+        };
+        Ok(crate::relations::RelationProposalSettings {
+            heads_per_relation: self
+                .relation_heads_per_type
+                .ok_or_else(|| missing("relation_heads_per_type"))?,
+            tails_per_relation: self
+                .relation_tails_per_type
+                .ok_or_else(|| missing("relation_tails_per_type"))?,
+            pair_cap: self
+                .relation_pair_cap
+                .ok_or_else(|| missing("relation_pair_cap"))?,
+            argument_threshold: self
+                .relation_argument_proposal_threshold
+                .ok_or_else(|| missing("relation_argument_proposal_threshold"))?,
+        })
+    }
+
+    /// `relation_temperature`, defaulting to 1.0 — the value this checkpoint
+    /// carries, and the one `gliner2`'s own config defaults to
+    /// (`configuration.py:110`), so a missing key is not ambiguous here.
+    pub fn relation_temperature(&self) -> f32 {
+        self.relation_temperature.unwrap_or(1.0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +156,25 @@ pub struct BoundaryParams {
     /// Without this the engine called `transform()` and the descriptions the
     /// crate can already build were unreachable from `BoundaryEngine`.
     pub descriptions: Vec<Vec<(String, String)>>,
+    /// Decode relations with the neural relation scorer.
+    ///
+    /// On by default, and a no-op on an export whose manifest does not declare
+    /// `enable_relation_scorer` — an older export keeps working and simply
+    /// returns no relations, rather than failing to load a fragment it never
+    /// shipped. Turn it off to skip the 23 MB fragment on a schema that does
+    /// carry relation groups but whose relations are not wanted.
+    pub decode_relations: bool,
+    /// The **decode** threshold for relations. `None` uses
+    /// [`Self::threshold`], which is what Python does: `_decode_relations`
+    /// takes the call's `threshold` and only a per-relation
+    /// `relation_metadata[name]["threshold"]` overrides it
+    /// (`engine.py:845-851`). On cognee's path both are 0.5.
+    ///
+    /// It is **not** `relation_argument_proposal_threshold` (0.2). That knob
+    /// selected the candidate arguments and has already been applied by
+    /// [`crate::relations::generate_pairs`]; proposing at 0.2 does not lower
+    /// the decode threshold.
+    pub relation_threshold: Option<f32>,
 }
 
 impl Default for BoundaryParams {
@@ -110,6 +186,8 @@ impl Default for BoundaryParams {
             classification_temperature: 1.0,
             multi_label_override: None,
             descriptions: Vec::new(),
+            decode_relations: true,
+            relation_threshold: None,
         }
     }
 }
@@ -194,10 +272,13 @@ pub struct BoundaryOutput {
     pub classifications: Vec<Classification>,
     /// Expected mention count per query, when the model exposes the count head.
     pub expected_counts: Vec<f32>,
-    /// Relations decoded inside the window that produced this output, ready to
-    /// be shifted by [`crate::chunker::remap`] and folded by
-    /// [`crate::chunker::merge`]. Nothing fills this in yet — the relation
-    /// scorer is not wired — so it is empty on every path today.
+    /// Relations decoded inside the window that produced this output, already
+    /// de-duplicated by [`crate::relation_decode::deduplicate_relation_edges`],
+    /// ready to be shifted by [`crate::chunker::remap`] and folded by
+    /// [`crate::chunker::merge`].
+    ///
+    /// Empty unless the schema carries relation groups, the export declares
+    /// `enable_relation_scorer`, and [`BoundaryParams::decode_relations`] is on.
     pub relations: Vec<RelationEdge>,
 }
 
@@ -689,6 +770,111 @@ impl BoundaryEngine {
                 .then(a.word_end.cmp(&b.word_end))
                 .then(a.field.cmp(&b.field))
         });
+
+        // ── 5. relations, scored INSIDE this window ───────────────────────
+        //
+        // Intra-window by construction, and deliberately so. The relation
+        // scorer indexes both endpoints against one padded length and divides
+        // their word distance by `text_len`, so a pair whose ends live in
+        // different windows has no shared frame. `gliner2` does the same: it
+        // scores per chunk and merges the *decoded* edges afterwards
+        // (`chunking._merge_relation_maps`), which is what
+        // [`crate::chunker::merge`] reproduces.
+        //
+        // This is also the fix for the long-document blow-up: pairing after the
+        // windows were merged manufactured edges spanning hundreds of words
+        // that the model was never asked about.
+        if params.decode_relations && self.manifest.enable_relation_scorer {
+            let mut specs: Vec<crate::relations::RelationTypeSpec> = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            let mut role_queries: Vec<(usize, usize)> = Vec::new();
+            for (g, task) in record.tasks.iter().enumerate() {
+                if task.task_type != TaskType::Relations {
+                    continue;
+                }
+                // `model.py` emits exactly two children per relation group, the
+                // head role then the tail role, so the query ids are the two
+                // positions `query_markers` gave this group.
+                let head_q = query_specs.iter().position(|&(gg, r)| gg == g && r == 0);
+                let tail_q = query_specs.iter().position(|&(gg, r)| gg == g && r == 1);
+                let (head_q, tail_q) = match (head_q, tail_q) {
+                    (Some(head_q), Some(tail_q)) => (head_q, tail_q),
+                    _ => continue,
+                };
+                specs.push(crate::relations::RelationTypeSpec::new(
+                    task.task_name.clone(),
+                    vec![head_q],
+                    vec![tail_q],
+                ));
+                names.push(task.task_name.clone());
+                role_queries.push((head_q, tail_q));
+            }
+
+            if !specs.is_empty() {
+                // The proposal pool is the head's RAW candidate set: Python
+                // hands `_decode_relations` the same `candidates` object the
+                // span decoder started from, before abstention and before the
+                // per-query threshold, so neither is applied here.
+                let query_mask = vec![true; num_queries];
+                let view = crate::relations::CandidateView {
+                    indices: &cand_indices,
+                    pair_logits: &pair_logits,
+                    valid_mask: &cand_valid,
+                    query_mask: &query_mask,
+                    queries: num_queries,
+                    cand_count: c,
+                };
+                let settings = self.manifest.relation_proposal_settings()?;
+                let pairs = crate::relations::generate_pairs(&view, &specs, &settings);
+
+                if !pairs.is_empty() {
+                    // The two query states per relation, as rows of the same
+                    // `query_states` the head consumed. `Carrier::host` copies
+                    // back from the device when the chain is bound; it is
+                    // Q x 768 floats, not the encoder output.
+                    let all_queries = query_states.host(self.dtype)?;
+                    let want = num_queries * hidden_size;
+                    if all_queries.len() != want {
+                        return Err(anyhow!(
+                            "query_states hold {} floats, expected {want} for {num_queries} \
+                             queries x {hidden_size} hidden",
+                            all_queries.len(),
+                        ));
+                    }
+                    let mut head_states = Vec::with_capacity(specs.len() * hidden_size);
+                    let mut tail_states = Vec::with_capacity(specs.len() * hidden_size);
+                    for &(head_q, tail_q) in &role_queries {
+                        head_states
+                            .extend_from_slice(&all_queries[head_q * hidden_size..][..hidden_size]);
+                        tail_states
+                            .extend_from_slice(&all_queries[tail_q * hidden_size..][..hidden_size]);
+                    }
+
+                    let logits = self.score_relation_pairs(RelationScoreInputs {
+                        text_states: &text_states,
+                        padded_words: bucket,
+                        relation_query_head: &head_states,
+                        relation_query_tail: &tail_states,
+                        relations: specs.len(),
+                        pairs: &pairs,
+                        // The window's own word count — never the bucket. See
+                        // the comment at the call site inside
+                        // `score_relation_pairs`.
+                        text_len: num_words,
+                    })?;
+
+                    let decoder = crate::relation_decode::EdgeDecoder {
+                        relation_names: &names,
+                        text,
+                        word_to_char: &record.word_to_char_maps,
+                        num_words,
+                        threshold: params.relation_threshold.unwrap_or(params.threshold),
+                        temperature: self.manifest.relation_temperature(),
+                    };
+                    output.relations = decoder.decode(&pairs, &logits);
+                }
+            }
+        }
 
         self.run_classifications(&record, &hidden, seq, hidden_size, params, &mut output)?;
         Ok(output)

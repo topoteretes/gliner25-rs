@@ -22,6 +22,7 @@
 //! | [`runtime`] | `ort` helpers, precision selection, export-layout resolution |
 //! | [`overlap`] | span overlap policies |
 //! | [`boundary`] | the inference engine |
+//! | [`relation_decode`] | relation logits -> de-duplicated edges |
 //! | [`error`] | diagnosable engine errors |
 //!
 //! The first four are architecture-agnostic — identical to what the span engine
@@ -47,6 +48,9 @@ pub mod overlap;
 pub mod processor;
 /// Typed, capped relation-pair proposal — the port of `gliner2`'s
 /// `TypedRelationPairGenerator`, whose stable sorts torch cannot export.
+/// Decoding relation-scorer logits into edges, and the four-stage
+/// de-duplication `gliner2` applies before emitting them.
+pub mod relation_decode;
 pub mod relations;
 pub mod runtime;
 
@@ -65,6 +69,10 @@ pub use chunker::{Chunker, RelationKeyMode};
 pub use error::GlinerError;
 pub use overlap::{OverlapPolicy, Spanned, resolve_overlaps};
 pub use processor::{ProcessedRecord, SchemaTask, SchemaTransformer, TaskMapping, TaskType};
+pub use relation_decode::{
+    EdgeDecoder, canonicalise_containment, collapse_semantic_duplicates,
+    deduplicate_relation_edges, drop_dominated_by_token_superset, sort_edges,
+};
 pub use relations::{
     ArgumentSlot, CandidateView, ProposedPair, RelationProposal, RelationProposalSettings,
     RelationTypeSpec, generate_pairs, generate_pairs_detailed,

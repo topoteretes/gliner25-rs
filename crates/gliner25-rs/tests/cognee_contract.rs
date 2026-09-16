@@ -65,7 +65,6 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use gliner25_rs::{
     BoundaryConfig, BoundaryEngine, BoundaryParams, Chunker, OverlapPolicy, SchemaTask,
-    pair_relations,
 };
 use serde::Deserialize;
 
@@ -374,11 +373,43 @@ fn run(models: &Path) -> Result<()> {
             .iter()
             .map(|(n, _)| (n.clone(), BTreeSet::new()))
             .collect();
-        for (h, t, prompt) in pair_relations(&out.mentions, &tasks) {
-            let key = rel_key.get(&prompt).cloned().unwrap_or(prompt);
+        // Relations come from the engine's own decode now — scored inside each
+        // window by the neural relation scorer and folded by `chunker::merge` —
+        // not from `pair_relations`, the type-compatible cartesian product this
+        // gate used while the scorer was unwired.
+        for edge in &out.relations {
+            let key = rel_key
+                .get(&edge.relation)
+                .cloned()
+                .unwrap_or_else(|| edge.relation.clone());
             rels.entry(key)
                 .or_default()
-                .insert(format!("{}|{}", h.text, t.text));
+                .insert(format!("{}|{}", edge.head.text, edge.tail.text));
+        }
+
+        // ── relations are scored INSIDE a window, and must stay that way ──
+        //
+        // Before the scorer was wired this gate built relations by pairing the
+        // merged mention list, which manufactured edges spanning the whole
+        // document — the `very_long` scenario alone produced 44 of them against
+        // Python's 12. The engine now decodes per window and lets
+        // `chunker::merge` fold the results, so after remapping, both ends of
+        // every edge came from the same window and cannot be more than one
+        // chunk apart. A future change that re-pairs after merging fails here
+        // rather than only showing up as a worse precision number.
+        for edge in &out.relations {
+            let span = edge.head.word_start.max(edge.tail.word_start)
+                - edge.head.word_start.min(edge.tail.word_start);
+            assert!(
+                span < chunker.size(),
+                "scenario `{}`: edge {}|{} spans {span} words, wider than the {}-word window \
+                 it was supposed to be scored in — relations are being paired after the \
+                 windows were merged",
+                sc.name,
+                edge.head.text,
+                edge.tail.text,
+                chunker.size(),
+            );
         }
 
         rows.push(Row {
