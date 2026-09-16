@@ -45,6 +45,9 @@ pub mod error;
 pub mod hub;
 pub mod overlap;
 pub mod processor;
+/// Typed, capped relation-pair proposal — the port of `gliner2`'s
+/// `TypedRelationPairGenerator`, whose stable sorts torch cannot export.
+pub mod relations;
 pub mod runtime;
 
 /// Schema families: splitting a wide schema into groups of related labels and
@@ -62,6 +65,10 @@ pub use chunker::{Chunker, RelationKeyMode};
 pub use error::GlinerError;
 pub use overlap::{OverlapPolicy, Spanned, resolve_overlaps};
 pub use processor::{ProcessedRecord, SchemaTask, SchemaTransformer, TaskMapping, TaskType};
+pub use relations::{
+    ArgumentSlot, CandidateView, ProposedPair, RelationProposal, RelationProposalSettings,
+    RelationTypeSpec, generate_pairs, generate_pairs_detailed,
+};
 pub use runtime::Precision;
 
 /// Initialises the ONNX Runtime environment. Call once per process; later calls
