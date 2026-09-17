@@ -328,15 +328,53 @@ pub struct BoundaryConfig {
 impl BoundaryConfig {
     pub fn new(models_dir: impl Into<PathBuf>) -> Self {
         let models_dir = models_dir.into();
-        let precision = Precision::autodetect(&models_dir, "encoder");
+        // GLINER2_PRECISION is as explicit as calling with_precision.
+        let precision_pinned = std::env::var("GLINER2_PRECISION").is_ok();
+        let execution = ExecutionMode::from_env();
+        let mut precision = Precision::autodetect(&models_dir, "encoder");
+
+        // COGNEE FORK DELTA: reconcile the autodetected variant with the
+        // transport, for a directory that already holds the export.
+        //
+        // `autodetect` answers "which variants are on disk", and every full
+        // export ships all three, so it always returns `Fp16IoBinding` off
+        // macOS. `preferred_precision` is the correction — the `_fp16_iobinding`
+        // graphs exist to keep FP16 *at the graph boundaries* so a bound chain
+        // can hand one fragment's output to the next untouched; a `Standard`
+        // transport gains nothing from that. Upstream only applies the
+        // correction on the `hub` download path (below), where the manifest is
+        // missing, so a local export ran the FP16 I/O graphs under a CPU
+        // `Standard` chain — never what either variant was meant for.
+        //
+        // That is not just a lost optimisation, it is lost accuracy, and how
+        // much depends on the ISA. On x86 the CPU EP has no native FP16
+        // kernels, so it casts up and the numbers survive (measured: identical
+        // entity sets, and fp16 ~23% *slower* for the casts). On ARMv8.2 —
+        // every recent phone — FP16 arithmetic is native, so ORT really runs
+        // the graph in half precision: on a Galaxy S24 Ultra the same document
+        // yielded 329 entities / 198 edges against fp32's 576 / 377, a silent
+        // 43% entity loss, while fp32 was also the faster of the two.
+        //
+        // So: honour an explicit pin, keep `Fp16IoBinding` when the transport
+        // really is bound (a device EP), and otherwise fall back to FP32 — but
+        // only when FP32 is actually on disk, so a half-populated export still
+        // loads instead of failing.
+        let downgrade = !precision_pinned
+            && precision == Precision::Fp16IoBinding
+            && execution.preferred_precision() != Precision::Fp16IoBinding
+            && crate::runtime::resolve_fragment(&models_dir, "encoder", Precision::Fp32)
+                .is_some();
+        if downgrade {
+            precision = Precision::Fp32;
+        }
+
         Self {
             models_dir,
             precision,
             intra_threads: 4,
             lazy_heads: true,
-            execution: ExecutionMode::from_env(),
-            // GLINER2_PRECISION is as explicit as calling with_precision.
-            precision_pinned: std::env::var("GLINER2_PRECISION").is_ok(),
+            execution,
+            precision_pinned,
             #[cfg(feature = "hub")]
             hub: None,
         }

@@ -286,6 +286,47 @@ path today and no existing behaviour changes. `pair_relations` is untouched.
 
 ---
 
+## Delta 5 — a local export no longer runs the FP16 I/O graphs on a CPU chain
+
+**File:** `crates/gliner25-rs/src/boundary.rs`, `BoundaryConfig::new` (marked
+`COGNEE FORK DELTA`).
+
+`BoundaryConfig::new` took `Precision::autodetect(&models_dir, "encoder")` as
+final. `autodetect` answers only "which variants are on disk", and a full export
+ships all three, so off macOS it always returned `Fp16IoBinding`.
+`ExecutionMode::preferred_precision` is upstream's own correction for that — the
+`_fp16_iobinding` graphs keep FP16 *at the graph boundaries* so a bound chain can
+pass a fragment's output to the next untouched, and a `Standard` chain gains
+nothing from it — but upstream calls it in exactly one place
+(`BoundaryEngine::new`, inside `#[cfg(feature = "hub")]`, and only when the
+manifest is absent). With the export already on disk it never ran, so a CPU
+`Standard` chain loaded the FP16 I/O graphs.
+
+`BoundaryConfig::new` now applies the same correction: an explicit pin
+(`with_precision` / `GLINER2_PRECISION`) still wins, `Fp16IoBinding` is kept
+whenever the transport really is bound, and otherwise the choice falls back to
+FP32 — but only if the FP32 fragments are on disk, so a half-populated export
+still loads. Nothing else is touched, and on a device build with an I/O-binding
+transport the resolved precision is unchanged.
+
+**Why cognee needs it.** The cost is accuracy, not just speed, and it is
+ISA-dependent. The x86 CPU EP has no native FP16 kernels, so it casts up: entity
+sets were identical and fp16 was ~23% *slower* (105.7 s vs 98.2 s wall on the
+parity corpus). ARMv8.2 has native FP16, so ORT genuinely runs the graph in half
+precision — on a Galaxy S24 Ultra the same document gave **329 entities / 198
+edges** under the old default against **576 / 377** under FP32, a silent 43%
+entity loss, with FP32 also the faster of the two (272 s vs 318 s). cognee ships
+on Android, so the old default was a data-loss bug there.
+
+**Effect on this crate's own gates.** `tests/cognee_contract.rs` builds its
+config with `BoundaryConfig::new`, so it now reports `precision=Fp32` where it
+reported `precision=Fp16IoBinding`. Its numbers are unchanged
+(`ent_R=1.000 ent_P=1.000 rel_R=1.000 rel_P=1.000`, entity sets still exactly
+equal to the Python reference per scenario) — as the file's own header already
+recorded, the two precisions agreed exactly on x86.
+
+---
+
 ## Deliberately not changed
 
 - **Formatting.** Upstream's tree is not `cargo fmt`-clean under default
