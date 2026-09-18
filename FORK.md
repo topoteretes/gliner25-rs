@@ -327,6 +327,57 @@ recorded, the two precisions agreed exactly on x86.
 
 ---
 
+## Delta 6 — a missing relation scorer is named, not silently skipped
+
+**File:** `crates/gliner25-rs/src/boundary.rs`, `BoundaryEngine::new` and
+`BoundaryEngine::extract_once` (both marked `COGNEE FORK DELTA 6`).
+
+`BoundaryManifest::enable_relation_scorer` is `#[serde(default)]`, and the
+relation block in `extract_once` was gated on it:
+
+```rust
+if params.decode_relations && self.manifest.enable_relation_scorer {
+```
+
+With the key absent the whole block was skipped — **no error, no warning**. The
+engine returned a `BoundaryOutput` with mentions and an empty `relations` vec,
+which is indistinguishable from "this text has no relations". Two changes:
+
+1. **At load.** `BoundaryEngine::new` prints one `[gliner25] warning:` line
+   naming the directory when the manifest does not declare
+   `enable_relation_scorer`, stating that no relations will be decoded from it
+   whatever the schema asks for. `eprintln!` rather than a log macro because
+   this crate has no logging dependency (`runtime.rs:114` and `hub.rs:98`
+   already warn the same way).
+2. **At extract.** `extract_once` now computes
+   `wants_relations = params.decode_relations && any(task.task_type ==
+   TaskType::Relations)` and returns `GlinerError::IncompleteModelDir` when that
+   is true and the manifest declares no scorer. A relation group in the schema
+   *is* the explicit request, which is why it — and not
+   `decode_relations` alone, which defaults to `true` — is the trigger.
+
+**Why cognee needs it.** `cognee-gliner`'s `GlinerGraphBackend` derives every
+edge from `iter_relations`, so on an export without a scorer the knowledge graph
+came out with nodes and no edges and nothing said why. Measured on one sentence,
+one schema, one binary: the certified `gliner2.5-base-v1` export gives
+**4 entities / 2 relations**; `jugaadsrl/gliner2.5-multi-v1-onnx`, which was
+`cognee-gliner`'s default download until the certified export was published as
+a GitHub release, gives **3 entities / 0 relations**. For a feature whose pitch
+is LLM-free *graph* extraction, an empty edge set is not a degraded answer.
+
+**Behaviour preserved.** An export without a scorer still loads, and still
+serves an entity-only schema unchanged — the error fires only when relation
+groups are actually in the schema. A caller that wants entities out of such an
+export sets `BoundaryParams::decode_relations = false`; cognee additionally
+exposes `COGNEE_GLINER_ALLOW_MISSING_RELATION_SCORER=1`, which downgrades its
+own equivalent check to a warning.
+
+**Not sent upstream.** Deliberately, for now: it is a behaviour change to a
+published API and upstream may prefer a warning to an error. It is recorded here
+so the decision is visible rather than lost.
+
+---
+
 ## Deliberately not changed
 
 - **Formatting.** Upstream's tree is not `cargo fmt`-clean under default

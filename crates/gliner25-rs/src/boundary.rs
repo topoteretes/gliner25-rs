@@ -511,6 +511,21 @@ impl BoundaryEngine {
             .into());
         }
 
+        // COGNEE FORK DELTA 6: say so at load, once, rather than at the end of
+        // an extraction that quietly returned no edges. `enable_relation_scorer`
+        // is `#[serde(default)]`, so an older or partial export simply omits it
+        // and nothing downstream distinguishes "no relations in this text" from
+        // "this model cannot emit relations at all".
+        if !manifest.enable_relation_scorer {
+            eprintln!(
+                "[gliner25] warning: boundary_manifest.json in {} does not declare \
+                 enable_relation_scorer. This export carries no relation scorer: NO \
+                 relations will be decoded from it, whatever the schema asks for. \
+                 Entity extraction is unaffected.",
+                dir.display()
+            );
+        }
+
         let default_policy = OverlapPolicy::parse(&manifest.overlap_policy).ok_or_else(|| {
             anyhow!("overlap_policy '{}' not recognised", manifest.overlap_policy)
         })?;
@@ -822,7 +837,32 @@ impl BoundaryEngine {
         // This is also the fix for the long-document blow-up: pairing after the
         // windows were merged manufactured edges spanning hundreds of words
         // that the model was never asked about.
-        if params.decode_relations && self.manifest.enable_relation_scorer {
+        // COGNEE FORK DELTA 6: an export with no relation scorer is named, not
+        // skipped. The gate used to read `params.decode_relations &&
+        // self.manifest.enable_relation_scorer`, so a schema full of relation
+        // groups against an export whose manifest omits the key produced a
+        // result with zero edges, no error and no warning. Asking for relations
+        // and getting none is not a degraded answer; it is the wrong one. A
+        // relation group in the schema *is* the explicit request, so it is the
+        // trigger. See FORK.md Delta 6.
+        let wants_relations = params.decode_relations
+            && record
+                .tasks
+                .iter()
+                .any(|task| task.task_type == TaskType::Relations);
+        if wants_relations && !self.manifest.enable_relation_scorer {
+            return Err(GlinerError::IncompleteModelDir(format!(
+                "the schema asks for relations but boundary_manifest.json in {} does not \
+                 declare enable_relation_scorer: this export carries no relation scorer, \
+                 so every edge would be silently dropped. Use an export that ships \
+                 relation_scorer{}.onnx, or set BoundaryParams::decode_relations = false \
+                 to ask for entities only.",
+                self.dir.display(),
+                self.precision.suffix(),
+            ))
+            .into());
+        }
+        if wants_relations {
             let mut specs: Vec<crate::relations::RelationTypeSpec> = Vec::new();
             let mut names: Vec<String> = Vec::new();
             let mut role_queries: Vec<(usize, usize)> = Vec::new();
