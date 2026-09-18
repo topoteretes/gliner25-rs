@@ -83,6 +83,15 @@ pub struct BoundaryParams {
     /// right place for that decision, since a single request routinely mixes
     /// single-label and multi-label tasks.
     pub multi_label_override: Option<bool>,
+    /// COGNEE-EVAL PATCH. Per-group `label -> description` pairs, folded into
+    /// that group's single `prompt_str` token (the token at schema index 2) by
+    /// [`SchemaTransformer::transform_with_descriptions`], exactly as Python's
+    /// `SchemaTransformer._transform_schema` does. Empty by default, which
+    /// reproduces the previous behaviour byte for byte.
+    ///
+    /// Without this the engine called `transform()` and the descriptions the
+    /// crate can already build were unreachable from `BoundaryEngine`.
+    pub descriptions: Vec<Vec<(String, String)>>,
 }
 
 impl Default for BoundaryParams {
@@ -93,6 +102,7 @@ impl Default for BoundaryParams {
             use_abstention: true,
             classification_temperature: 1.0,
             multi_label_override: None,
+            descriptions: Vec::new(),
         }
     }
 }
@@ -468,7 +478,12 @@ impl BoundaryEngine {
         tasks: &[SchemaTask],
         params: &BoundaryParams,
     ) -> Result<BoundaryOutput> {
-        let record = self.transformer.transform(text, tasks)?;
+        // COGNEE-EVAL PATCH: was `self.transformer.transform(text, tasks)?`,
+        // which hard-coded an empty description list and made
+        // `transform_with_descriptions` dead code.
+        let record =
+            self.transformer
+                .transform_with_descriptions(text, tasks, &params.descriptions)?;
         let num_words = record.num_words();
         if num_words == 0 {
             return Ok(BoundaryOutput::default());
